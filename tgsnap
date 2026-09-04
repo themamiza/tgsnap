@@ -1,0 +1,1073 @@
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from telethon import TelegramClient, functions, types
+from telethon.errors import FloodWaitError, RPCError
+
+load_dotenv()
+
+DEFAULT_SESSION = "tgsnap"
+USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+##### TARGET MODEL #####
+
+class LookupKind(Enum):
+    PHONE = "phone"
+    ID = "id"
+    NAME = "name"
+    INVITE = "invite"
+
+class TargetType(Enum):
+    USER = "user"
+    GROUP = "group"
+    CHANNEL = "channel"
+
+
+@dataclass
+class Target:
+    """Resolved Telegram target.
+
+    entity:
+        Telegram User/Chat/Channel when Telegram exposes one. A plain private
+        invite preview has no entity ID, so this may be None.
+    type:
+        Final target type used for collection and storage.
+    source:
+        How the target was resolved: entity, invite_preview, invite_peek, etc.
+    invite:
+        Result returned by messages.checkChatInvite for private invite links.
+    invite_hash:
+        Invite hash kept only in memory. It is never written to snapshots.
+    temporary_contact:
+        True when phone lookup temporarily imported the user as a contact.
+    """
+
+    entity: Any | None
+    type: TargetType
+    source: str = "entity"
+    invite: Any | None = None
+    invite_hash: str | None = None
+    temporary_contact: bool = False
+
+    @property
+    def id(self) -> int | None:
+        return getattr(self.entity, "id", None)
+
+    @property
+    def username(self) -> str | None:
+        return getattr(self.entity, "username", None)
+
+    @property
+    def name(self) -> str:
+        if isinstance(self.entity, types.User):
+            return " ".join(
+                part for part in (self.entity.first_name, self.entity.last_name) if part
+            ) or "Unnamed user"
+
+        title = getattr(self.entity, "title", None)
+        if title:
+            return title
+
+        return getattr(self.invite, "title", None) or "Unnamed"
+
+    @property
+    def storage_key(self) -> str:
+        """Stable-ish folder prefix without exposing a private invite hash."""
+        if self.id is not None:
+            return str(self.id)
+        assert self.invite_hash is not None
+        return f"invite-{hashlib.sha256(self.invite_hash.encode()).hexdigest()[:12]}"
+
+
+@dataclass
+class Snapshot:
+    """A collected Telegram snapshot and the files created for it.
+
+    Attributes:
+        data: Parsed snapshot data that is written to snapshot.json.
+        json_file: Path to the snapshot.json file on disk.
+        directory: Directory containing the snapshot and its downloaded media.
+    """
+    data: dict[str, Any]
+    json_file: Path
+    directory: Path
+
+
+##### TUI #####
+
+def paint(code: str, value: Any) -> str:
+    text = str(value)
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def bold(value: Any) -> str:
+    return paint("1", value)
+
+def dim(value: Any) -> str:
+    return paint("2", value)
+
+
+def terminal_width() -> int:
+    return max(72, min(shutil.get_terminal_size((100, 24)).columns, 120))
+
+
+def human_time(value: str | None) -> str:
+    return value.replace("T", " ").replace("+00:00", " UTC") if value else "—"
+
+def human_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+def human_size(size: int | None) -> str:
+    if size is None:
+        return "—"
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return str(size)
+
+
+def print_header(title: str) -> None:
+    label = f" {title} "
+    right = max(0, terminal_width() - 4 - len(label))
+    print(paint("36", "╭──" + label + "─" * right + "╮"))
+
+def print_footer() -> None:
+    print(paint("36", "╰" + "─" * (terminal_width() - 2) + "╯"))
+
+def print_field(label: str, value: Any) -> None:
+    print(f"{bold((label + ':').ljust(23))} {'—' if value in (None, '') else value}")
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        print(dim("  None"))
+        return
+
+    widths = [max(len(header), *(len(row[i]) for row in rows)) for i, header in enumerate(headers)]
+    overflow = sum(widths) + 3 * (len(widths) - 1) - terminal_width()
+
+    for index in reversed(range(len(widths))):
+        if overflow <= 0:
+            break
+        minimum = max(8, len(headers[index]))
+        reduction = min(max(0, widths[index] - minimum), overflow)
+        widths[index] -= reduction
+        overflow -= reduction
+
+    def fit(value: str, width: int) -> str:
+        value = value if len(value) <= width else value[: max(0, width - 1)] + "…"
+        return value.ljust(width)
+
+    print(" │ ".join(bold(fit(value, widths[i])) for i, value in enumerate(headers)))
+    print(dim("─┼─".join("─" * width for width in widths)))
+    for row in rows:
+        print(" │ ".join(fit(value, widths[i]) for i, value in enumerate(row)))
+
+
+##### LIVE STATS #####
+class LiveStatus:
+    """Redraw a temporary status block and erase only that block when done."""
+
+    LABELS = ("Lookup", "Found", "Info", "Photos", "Fallback", "Music")
+
+    def __init__(self) -> None:
+        self.enabled = sys.stdout.isatty()
+        self.values = {label: "waiting…" for label in self.LABELS}
+        self.started = False
+
+    def set(self, label: str, value: str) -> None:
+        """Update one status line and redraw the whole temporary block."""
+        if label in self.values:
+            self.values[label] = value
+            self._draw()
+
+    def _draw(self) -> None:
+        if not self.enabled:
+            return
+
+        if self.started:
+            sys.stdout.write(f"\033[{len(self.LABELS)}A")
+        else:
+            self.started = True
+
+        for label in self.LABELS:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.write(f"{bold((label + ':').ljust(11))} {self.values[label]}\n")
+        sys.stdout.flush()
+
+    def clear(self) -> None:
+        """Erase this command's status block without clearing terminal history."""
+        if not self.enabled or not self.started:
+            return
+
+        count = len(self.LABELS)
+        sys.stdout.write(f"\033[{count}A")
+        for _ in self.LABELS:
+            sys.stdout.write("\r\033[2K\n")
+        sys.stdout.write(f"\033[{count}A\r")
+        sys.stdout.flush()
+        self.started = False
+
+
+##### DATA AND DISPLAY #####
+
+def to_iso(value: Any) -> str | None:
+    return value.isoformat() if value else None
+
+
+def safe_path_part(value: str) -> str:
+    value = re.sub(r"\s+", "_", value.strip())
+    value = re.sub(r"[^\w.-]", "_", value, flags=re.UNICODE)
+    return re.sub(r"_+", "_", value).strip("._-") or "no_name"
+
+
+def flags_from(snapshot: dict[str, Any]) -> list[str]:
+    flags = []
+    for key, color in (("verified", "32"), ("premium", "33"), ("bot", None), ("scam", "31"), ("fake", "31")):
+        if snapshot.get(key):
+            flags.append(paint(color, key) if color else key)
+    return flags
+
+
+def photo_rows(photos: list[dict[str, Any]]) -> list[list[str]]:
+    return [
+        [
+            str(index),
+            human_time(photo.get("date")),
+            "yes" if photo.get("has_video") else "no",
+            str(photo.get("photo_id") or "—"),
+            photo.get("file") or "—",
+        ]
+        for index, photo in enumerate(photos, start=1)
+    ]
+
+
+def display_snapshot(result: Snapshot) -> None:
+    """Print a saved/live Snapshot using the same terminal representation."""
+    snapshot = result.data
+    target_type = snapshot["target_type"]
+    username = snapshot.get("username")
+    is_user = target_type == TargetType.USER.value
+    label = "User" if is_user else target_type.title()
+    title = f"Telegram {label}" + (f" · @{username}" if username else "")
+
+    print()
+    print_header(title)
+    print()
+    print_field("Type", target_type)
+    print_field("Source", snapshot["source"])
+
+    if is_user:
+        name = " ".join(part for part in (snapshot.get("first_name"), snapshot.get("last_name")) if part) or "—"
+        print_field("Name", name)
+    else:
+        print_field("Title", snapshot.get("title"))
+
+    print_field("Username", f"@{username}" if username else None)
+    print_field("ID", snapshot.get("id"))
+
+    if is_user:
+        print_field("Bio", snapshot.get("bio"))
+        print_field("Flags", ", ".join(flags_from(snapshot)) or "none")
+        birthday = snapshot.get("birthday")
+
+        if birthday:
+            year = birthday.get("year")
+            month = birthday.get("month")
+            day = birthday.get("day")
+
+            birthday_text = f"{year or '????'}-{month:02d}-{day:02d}"
+
+            if year:
+                today = datetime.now(timezone.utc).date()
+                age = today.year - year - (
+                    (today.month, today.day) < (month, day)
+                )
+                birthday_text += f" ({age})"
+        else:
+            birthday_text = "—"
+
+        print_field("Birthday", birthday_text)
+        print_field("Personal channel ID", snapshot.get("personal_channel_id"))
+    else:
+        print_field("About", snapshot.get("about"))
+        print_field("Members", snapshot.get("participants_count"))
+        print_field("Admins", snapshot.get("admins_count"))
+        print_field("Linked chat ID", snapshot.get("linked_chat_id"))
+        print_field("Flags", ", ".join(flags_from(snapshot)) or "none")
+
+        if target_type == TargetType.GROUP.value:
+            print_field("Forum", _yes_no(snapshot.get("forum")))
+            print_field("Slow mode", snapshot.get("slowmode_seconds"))
+
+        if snapshot.get("invite_preview"):
+            print_field("Public", _yes_no(snapshot.get("public")))
+            print_field("Join approval", _yes_no(snapshot.get("request_needed")))
+            print_field("Peek available", _yes_no(snapshot.get("peek_available")))
+            print_field("Peek expires", human_time(snapshot.get("peek_expires")))
+            preview = snapshot.get("preview_participants", [])
+            print_field("Preview users", len(preview) if preview else None)
+
+    print_field("Scraped at", human_time(snapshot.get("scraped_at")))
+
+    photos = snapshot.get("photos", [])
+    print(f"\n{bold(f'Photos ({len(photos)})')}")
+    print_table(["#", "Uploaded", "Video", "Photo ID", "File"], photo_rows(photos))
+
+    if is_user:
+        fallback = snapshot.get("fallback_photo")
+        fallback_rows = photo_rows([fallback]) if fallback else []
+        print(f"\n{bold('Fallback / public photo')}")
+        print_table(["#", "Uploaded", "Video", "Photo ID", "File"], fallback_rows)
+
+        music = snapshot.get("music", [])
+        music_rows = [
+            [
+                str(index),
+                song.get("title") or song.get("file_name") or "Unknown",
+                song.get("performer") or "—",
+                human_duration(song.get("duration_seconds")),
+                human_time(song.get("date")),
+                human_size(song.get("size")),
+            ]
+            for index, song in enumerate(music, start=1)
+        ]
+        print(f"\n{bold(f'Profile music ({len(music)})')}")
+        print_table(["#", "Title", "Artist", "Length", "Date", "Size"], music_rows)
+
+    print()
+    print_field("Snapshot", result.directory)
+    print_field("JSON backup", result.json_file)
+    print()
+    print_footer()
+    print()
+
+
+def _yes_no(value: Any) -> str:
+    if value is None:
+        return "—"
+    return "yes" if value else "no"
+
+
+##### SNAPSHOT I/O #####
+
+def read_snapshot(path: Path) -> Snapshot:
+    """Read snapshot.json and return a Snapshot."""
+    path = path.expanduser().resolve()
+
+    if path.is_dir():
+        snapshot_dir, json_file = path, path / "snapshot.json"
+    elif path.is_file() and path.name == "snapshot.json":
+        snapshot_dir, json_file = path.parent, path
+    else:
+        raise SystemExit(f"Snapshot not found: {path}\nPass a snapshot directory or snapshot.json.")
+
+    if not json_file.is_file():
+        raise SystemExit(f"No snapshot.json found in: {snapshot_dir}")
+
+    try:
+        snapshot = json.loads(json_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not read snapshot {json_file}: {exc}") from exc
+
+    if not isinstance(snapshot, dict):
+        raise SystemExit(f"Invalid snapshot format: {json_file}")
+
+    return Snapshot(snapshot, json_file, snapshot_dir)
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+##### INPUT AND CREDENTIALS #####
+
+_INVITE_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:joinchat/|\+)([\w-]+)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_TG_INVITE_RE = re.compile(r"^tg://join\?invite=([\w-]+)", re.IGNORECASE)
+
+
+def extract_invite_hash(value: str) -> str | None:
+    """Return an invite hash for supported private invite URLs, otherwise None."""
+    value = value.strip()
+    match = _INVITE_RE.match(value) or _TG_INVITE_RE.match(value)
+    return match.group(1) if match else None
+
+
+def detect_lookup_kind(value: str) -> LookupKind:
+    """Classify raw TARGET without contacting Telegram."""
+    value = value.strip()
+    if extract_invite_hash(value):
+        return LookupKind.INVITE
+    if value.startswith(("+", "00")):
+        return LookupKind.PHONE
+    if re.fullmatch(r"-?\d+", value):
+        return LookupKind.ID
+    return LookupKind.NAME
+
+
+def normalize_name(value: str) -> str:
+    value = re.sub(r"^https?://(?:t\.me|telegram\.me|telegram\.dog)/", "", value.strip())
+    return value.lstrip("@").split("/", 1)[0]
+
+
+def normalize_phone(value: str) -> str:
+    value = value.strip()
+    digits = re.sub(r"\D", "", value)
+    if value.startswith("00"):
+        digits = digits[2:]
+    if len(digits) < 7:
+        raise SystemExit("Phone number looks too short. Use the full international number, e.g. +15551234567.")
+    return f"+{digits}"
+
+
+def phone_digits(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def load_credentials() -> tuple[int, str, str]:
+    """Return (api_id, api_hash, session_name) from environment/.env."""
+    api_id = os.environ.get("TELEGRAM_API_ID")
+    api_hash = os.environ.get("TELEGRAM_API_HASH")
+    session = os.environ.get("TELEGRAM_SESSION", DEFAULT_SESSION)
+
+    if not api_id or not api_hash:
+        raise SystemExit("Missing TELEGRAM_API_ID or TELEGRAM_API_HASH. Add them to your .env file.")
+    try:
+        return int(api_id), api_hash, session
+    except ValueError as exc:
+        raise SystemExit("TELEGRAM_API_ID must be an integer.") from exc
+
+
+def default_output_dir() -> Path:
+    return Path(os.environ.get("TGSNAP_OUTPUT_DIR", "output")).expanduser()
+
+
+##### TARGET RESOLUTION #####
+
+def classify_entity(entity: Any) -> TargetType:
+    """Map a Telethon User/Chat/Channel object to tgsnap's target types."""
+    if isinstance(entity, types.User):
+        return TargetType.USER
+    if isinstance(entity, types.Chat):
+        return TargetType.GROUP
+    if isinstance(entity, types.Channel):
+        return TargetType.GROUP if (entity.megagroup or getattr(entity, "gigagroup", False)) else TargetType.CHANNEL
+    raise SystemExit("The resolved Telegram entity is not a user, group, or channel.")
+
+
+def classify_invite(invite: Any) -> TargetType:
+    """Determine group/channel type from a messages.checkChatInvite result."""
+    if isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)):
+        return classify_entity(invite.chat)
+    if isinstance(invite, types.ChatInvite):
+        return TargetType.CHANNEL if getattr(invite, "broadcast", False) else TargetType.GROUP
+    raise SystemExit("Telegram returned an unsupported invite type.")
+
+
+async def resolve_by_phone(client: TelegramClient, phone: str) -> tuple[types.User, bool]:
+    """Resolve PHONE to a user; return (user, temporary_contact_added)."""
+    phone = normalize_phone(phone)
+    wanted = phone_digits(phone)
+    contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+    existing = list(getattr(contacts, "users", []) or [])
+
+    for user in existing:
+        if isinstance(user, types.User) and phone_digits(user.phone) == wanted:
+            return user, False
+
+    result = await client(
+        functions.contacts.ImportContactsRequest(
+            contacts=[types.InputPhoneContact(client_id=0, phone=phone, first_name="tgsnap lookup", last_name="")]
+        )
+    )
+    imported = list(getattr(result, "imported", []) or [])
+    users = list(getattr(result, "users", []) or [])
+    if not imported or not users:
+        raise SystemExit(f"No Telegram user could be resolved for {phone}.")
+
+    user_id = getattr(imported[0], "user_id", None)
+    user = next((item for item in users if item.id == user_id), users[0])
+    if not isinstance(user, types.User):
+        raise SystemExit(f"{phone} did not resolve to a Telegram user account.")
+
+    return user, all(existing_user.id != user.id for existing_user in existing)
+
+
+async def resolve_by_id(client: TelegramClient, value: str) -> Any:
+    """Resolve numeric Telegram ID, populating Telethon's entity cache once if needed."""
+    entity_id = int(value)
+    try:
+        return await client.get_entity(entity_id)
+    except (ValueError, TypeError):
+        await client.get_dialogs(limit=None)
+
+    try:
+        return await client.get_entity(entity_id)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(
+            f"Could not resolve Telegram ID {entity_id}. The account may not have encountered this entity yet."
+        ) from exc
+
+
+async def resolve_invite(client: TelegramClient, invite_hash: str) -> Target:
+    """Inspect a private invite without joining or requesting membership.
+
+    Only messages.checkChatInvite is used here. ChatInvitePeek is treated as
+    metadata only: tgsnap never fetches messages through the temporary peek.
+    """
+    invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+
+    if isinstance(invite, types.ChatInviteAlready):
+        return Target(invite.chat, classify_entity(invite.chat), source="invite_already_member")
+
+    return Target(
+        invite.chat if isinstance(invite, types.ChatInvitePeek) else None,
+        classify_invite(invite),
+        source="invite_peek" if isinstance(invite, types.ChatInvitePeek) else "invite_preview",
+        invite=invite,
+        invite_hash=invite_hash,
+    )
+
+
+async def resolve_target(client: TelegramClient, value: str, status: LiveStatus) -> Target:
+    """Resolve raw TARGET and return a typed Target without joining anything."""
+    kind = detect_lookup_kind(value)
+    status.set("Lookup", f"detected {kind.value} · resolving…")
+
+    if kind is LookupKind.INVITE:
+        target = await resolve_invite(client, extract_invite_hash(value) or "")
+    elif kind is LookupKind.PHONE:
+        entity, temporary = await resolve_by_phone(client, value)
+        target = Target(entity, TargetType.USER, temporary_contact=temporary)
+    elif kind is LookupKind.ID:
+        entity = await resolve_by_id(client, value)
+        target = Target(entity, classify_entity(entity))
+    else:
+        name = normalize_name(value)
+        if not name:
+            raise SystemExit("Target is empty.")
+        entity = await client.get_entity(name)
+        target = Target(entity, classify_entity(entity))
+
+    status.set("Lookup", f"resolved as {target.type.value}")
+    return target
+
+
+##### COLLECTION #####
+
+def birthday_data(value: Any) -> dict[str, int | None] | None:
+    if value is None:
+        return None
+    return {"day": value.day, "month": value.month, "year": getattr(value, "year", None)}
+
+
+def audio_data(document: Any) -> dict[str, Any]:
+    """Convert a Telegram audio Document into JSON-friendly metadata."""
+    data = {
+        "document_id": getattr(document, "id", None),
+        "date": to_iso(getattr(document, "date", None)),
+        "mime_type": getattr(document, "mime_type", None),
+        "size": getattr(document, "size", None),
+        "title": None,
+        "performer": None,
+        "duration_seconds": None,
+        "file_name": None,
+    }
+    for attribute in getattr(document, "attributes", []) or []:
+        if isinstance(attribute, types.DocumentAttributeAudio):
+            data.update(title=attribute.title, performer=attribute.performer, duration_seconds=attribute.duration)
+        elif isinstance(attribute, types.DocumentAttributeFilename):
+            data["file_name"] = attribute.file_name
+    return data
+
+
+
+def _subscription_pricing(value: Any) -> dict[str, int] | None:
+    """Return Telegram Stars subscription pricing from an invite, if present."""
+    if value is None:
+        return None
+    return {"period": value.period, "amount": value.amount}
+
+
+def _bot_verification(value: Any) -> dict[str, Any] | None:
+    """Return third-party bot verification data from an invite, if present."""
+    if value is None:
+        return None
+    return {
+        "bot_id": getattr(value, "bot_id", None),
+        "icon": getattr(value, "icon", None),
+        "description": getattr(value, "description", None),
+    }
+
+def preview_user_data(user: types.User) -> dict[str, Any]:
+    """Store only user fields Telegram directly included in an invite preview."""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "bot": bool(user.bot),
+        "verified": bool(user.verified),
+        "premium": bool(user.premium),
+    }
+
+
+async def download_photo(
+    client: TelegramClient,
+    photo: Any,
+    directory: Path,
+    snapshot_dir: Path,
+    filename: str,
+) -> dict[str, Any] | None:
+    """Download PHOTO and return its JSON metadata, or None on no download."""
+    directory.mkdir(parents=True, exist_ok=True)
+    downloaded = await client.download_media(photo, file=str(directory / filename))
+    if not downloaded:
+        return None
+    return {
+        "photo_id": getattr(photo, "id", None),
+        "date": to_iso(getattr(photo, "date", None)),
+        "file": str(Path(downloaded).relative_to(snapshot_dir)),
+        "has_video": bool(getattr(photo, "video_sizes", None)),
+    }
+
+
+async def fetch_photos(client: TelegramClient, entity: Any, snapshot_dir: Path, status: LiveStatus) -> list[dict[str, Any]]:
+    """Download all profile/chat photo history visible to the authenticated account."""
+    status.set("Photos", "looking up profile photos…")
+    photos = list(await client.get_profile_photos(entity))
+    if not photos:
+        status.set("Photos", "none found")
+        return []
+
+    result = []
+    total = len(photos)
+    for index, photo in enumerate(photos, start=1):
+        date = getattr(photo, "date", None)
+        stamp = date.strftime("%Y%m%dT%H%M%SZ") if date else "unknown-date"
+        filename = f"{index:03d}_{stamp}_{getattr(photo, 'id', 'unknown')}.jpg"
+        status.set("Photos", f"downloading {index}/{total} · {filename}")
+        data = await download_photo(client, photo, snapshot_dir / "photos" / "profile", snapshot_dir, filename)
+        if data:
+            result.append(data)
+
+    status.set("Photos", f"downloaded {len(result)}/{total}")
+    return result
+
+
+async def fetch_fallback_photo(client: TelegramClient, photo: Any, snapshot_dir: Path, status: LiveStatus) -> dict[str, Any] | None:
+    """Download a user's public/fallback profile photo when Telegram provides it."""
+    if not isinstance(photo, types.Photo):
+        status.set("Fallback", "none found")
+        return None
+
+    date = getattr(photo, "date", None)
+    stamp = date.strftime("%Y%m%dT%H%M%SZ") if date else "unknown-date"
+    filename = f"{stamp}_{getattr(photo, 'id', 'unknown')}.jpg"
+    status.set("Fallback", f"downloading · {filename}")
+    result = await download_photo(client, photo, snapshot_dir / "photos" / "fallback", snapshot_dir, filename)
+    status.set("Fallback", "downloaded" if result else "download failed")
+    return result
+
+
+async def fetch_music(client: TelegramClient, user: types.User, status: LiveStatus) -> list[dict[str, Any]]:
+    """Return profile-music metadata visible for USER; no audio files are downloaded."""
+    request_type = getattr(functions.users, "GetSavedMusicRequest", None)
+    if request_type is None:
+        status.set("Music", "not supported by this Telethon version")
+        return []
+
+    songs, offset, limit = [], 0, 100
+    status.set("Music", "looking up profile music…")
+    try:
+        while True:
+            result = await client(request_type(id=user, offset=offset, limit=limit, hash=0))
+            documents = list(getattr(result, "documents", []) or [])
+            if not documents:
+                break
+            songs.extend(audio_data(document) for document in documents)
+            offset += len(documents)
+            status.set("Music", f"found {len(songs)} track(s)")
+            total = getattr(result, "count", None)
+            if len(documents) < limit or (total is not None and offset >= total):
+                break
+    except RPCError:
+        status.set("Music", "not available")
+        return []
+
+    status.set("Music", f"found {len(songs)} track(s)" if songs else "none found")
+    return songs
+
+
+async def collect_user(client: TelegramClient, target: Target, snapshot_dir: Path, scraped_at: datetime, status: LiveStatus) -> dict[str, Any]:
+    """Collect profile metadata/media for a resolved User target."""
+    user = target.entity
+    status.set("Found", f"{target.name}" + (f" · @{target.username}" if target.username else "") + f" · ID {target.id}")
+    status.set("Info", "fetching extended profile…")
+    full = (await client(functions.users.GetFullUserRequest(user))).full_user
+
+    found = [name for name, value in (("bio", full.about), ("birthday", getattr(full, "birthday", None))) if value]
+    status.set("Info", "found" + (f" · {', '.join(found)}" if found else ""))
+
+    return {
+        "target_type": TargetType.USER.value,
+        "source": target.source,
+        "scraped_at": scraped_at.isoformat(),
+        "id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "bio": full.about,
+        "verified": bool(user.verified),
+        "premium": bool(user.premium),
+        "bot": bool(user.bot),
+        "scam": bool(user.scam),
+        "fake": bool(user.fake),
+        "birthday": birthday_data(getattr(full, "birthday", None)),
+        "personal_channel_id": getattr(full, "personal_channel_id", None),
+        "photos": await fetch_photos(client, user, snapshot_dir, status),
+        "fallback_photo": await fetch_fallback_photo(client, getattr(full, "fallback_photo", None), snapshot_dir, status),
+        "music": await fetch_music(client, user, status),
+    }
+
+
+async def collect_channel(client: TelegramClient, target: Target, snapshot_dir: Path, scraped_at: datetime, status: LiveStatus) -> dict[str, Any]:
+    """Collect metadata/media for a channel or modern supergroup."""
+    channel = target.entity
+    status.set("Found", f"{target.name}" + (f" · @{target.username}" if target.username else "") + f" · ID {target.id}")
+    status.set("Info", "fetching extended info…")
+    status.set("Fallback", "not applicable")
+    status.set("Music", "not applicable")
+
+    full = (await client(functions.channels.GetFullChannelRequest(channel))).full_chat
+    count = getattr(full, "participants_count", None)
+    status.set("Info", "found" + (f" · {count} members" if count is not None else ""))
+
+    return {
+        "target_type": target.type.value,
+        "source": target.source,
+        "scraped_at": scraped_at.isoformat(),
+        "id": channel.id,
+        "username": channel.username,
+        "title": channel.title,
+        "about": getattr(full, "about", None),
+        "verified": bool(channel.verified),
+        "scam": bool(channel.scam),
+        "fake": bool(channel.fake),
+        "participants_count": count,
+        "admins_count": getattr(full, "admins_count", None),
+        "linked_chat_id": getattr(full, "linked_chat_id", None),
+        "slowmode_seconds": getattr(full, "slowmode_seconds", None),
+        "forum": bool(getattr(channel, "forum", False)),
+        "photos": await fetch_photos(client, channel, snapshot_dir, status),
+    }
+
+
+async def collect_basic_group(client: TelegramClient, target: Target, snapshot_dir: Path, scraped_at: datetime, status: LiveStatus) -> dict[str, Any]:
+    """Collect metadata/media for a legacy basic Telegram group (types.Chat)."""
+    chat = target.entity
+    status.set("Found", f"{chat.title} · ID {chat.id}")
+    status.set("Info", "fetching extended info…")
+    status.set("Fallback", "not applicable")
+    status.set("Music", "not applicable")
+
+    full = (await client(functions.messages.GetFullChatRequest(chat.id))).full_chat
+    participants = getattr(getattr(full, "participants", None), "participants", None)
+    count = len(participants) if isinstance(participants, list) else getattr(chat, "participants_count", None)
+    status.set("Info", "found" + (f" · {count} members" if count is not None else ""))
+
+    return {
+        "target_type": TargetType.GROUP.value,
+        "source": target.source,
+        "scraped_at": scraped_at.isoformat(),
+        "id": chat.id,
+        "username": None,
+        "title": chat.title,
+        "about": getattr(full, "about", None),
+        "verified": False,
+        "scam": False,
+        "fake": False,
+        "participants_count": count,
+        "admins_count": None,
+        "linked_chat_id": None,
+        "slowmode_seconds": None,
+        "forum": False,
+        "photos": await fetch_photos(client, chat, snapshot_dir, status),
+    }
+
+
+async def collect_invite_preview(client: TelegramClient, target: Target, snapshot_dir: Path, scraped_at: datetime, status: LiveStatus) -> dict[str, Any]:
+    """Collect only metadata returned by checkChatInvite.
+
+    No join/request APIs, message history, member enumeration, or peek-history
+    APIs are used. For ChatInvitePeek, only fields already present in the
+    returned chat object are recorded.
+    """
+    invite = target.invite
+    assert invite is not None
+
+    status.set("Found", f"{target.name}" + (f" · ID {target.id}" if target.id is not None else ""))
+    status.set("Fallback", "not applicable")
+    status.set("Music", "not applicable")
+    status.set("Info", "reading invite preview metadata…")
+
+    snapshot = {
+        "target_type": target.type.value,
+        "source": target.source,
+        "invite_preview": True,
+        "invite_fingerprint": hashlib.sha256((target.invite_hash or "").encode()).hexdigest()[:12],
+        "scraped_at": scraped_at.isoformat(),
+        "id": target.id,
+        "username": target.username,
+        "title": target.name,
+        "about": None,
+        "verified": False,
+        "scam": False,
+        "fake": False,
+        "participants_count": None,
+        "admins_count": None,
+        "linked_chat_id": None,
+        "slowmode_seconds": None,
+        "forum": False,
+        "public": None,
+        "request_needed": None,
+        "preview_participants": [],
+        "peek_available": False,
+        "peek_expires": None,
+        "photos": [],
+    }
+
+    if isinstance(invite, types.ChatInvite):
+        snapshot.update(
+            about=getattr(invite, "about", None),
+            verified=bool(getattr(invite, "verified", False)),
+            scam=bool(getattr(invite, "scam", False)),
+            fake=bool(getattr(invite, "fake", False)),
+            participants_count=getattr(invite, "participants_count", None),
+            public=bool(getattr(invite, "public", False)),
+            request_needed=bool(getattr(invite, "request_needed", False)),
+            channel=bool(getattr(invite, "channel", False)),
+            broadcast=bool(getattr(invite, "broadcast", False)),
+            megagroup=bool(getattr(invite, "megagroup", False)),
+            color=getattr(invite, "color", None),
+            can_refulfill_subscription=bool(getattr(invite, "can_refulfill_subscription", False)),
+            subscription_form_id=getattr(invite, "subscription_form_id", None),
+            subscription_pricing=_subscription_pricing(getattr(invite, "subscription_pricing", None)),
+            bot_verification=_bot_verification(getattr(invite, "bot_verification", None)),
+            preview_participants=[
+                preview_user_data(user)
+                for user in (getattr(invite, "participants", None) or [])
+                if isinstance(user, types.User)
+            ],
+        )
+
+        photo = getattr(invite, "photo", None)
+        if isinstance(photo, types.Photo):
+            status.set("Photos", "downloading invite preview photo…")
+            date = getattr(photo, "date", None)
+            stamp = date.strftime("%Y%m%dT%H%M%SZ") if date else "unknown-date"
+            data = await download_photo(
+                client,
+                photo,
+                snapshot_dir / "photos" / "invite",
+                snapshot_dir,
+                f"{stamp}_{getattr(photo, 'id', 'unknown')}.jpg",
+            )
+            if data:
+                snapshot["photos"] = [data]
+            status.set("Photos", "downloaded" if data else "not available")
+        else:
+            status.set("Photos", "none found")
+
+    elif isinstance(invite, types.ChatInvitePeek):
+        # Telegram exposes a chat object plus a temporary peek expiry. We do
+        # not exploit that access to fetch message history or extra metadata.
+        chat = invite.chat
+        snapshot.update(
+            username=getattr(chat, "username", None),
+            title=getattr(chat, "title", target.name),
+            verified=bool(getattr(chat, "verified", False)),
+            scam=bool(getattr(chat, "scam", False)),
+            fake=bool(getattr(chat, "fake", False)),
+            forum=bool(getattr(chat, "forum", False)),
+            public=bool(getattr(chat, "username", None)),
+            broadcast=bool(getattr(chat, "broadcast", False)),
+            megagroup=bool(getattr(chat, "megagroup", False)),
+            peek_available=True,
+            peek_expires=datetime.fromtimestamp(invite.expires, timezone.utc).isoformat(),
+        )
+        photo = getattr(chat, "photo", None)
+        photo_id = getattr(photo, "photo_id", None)
+        if photo_id:
+            snapshot["photos"] = [{"photo_id": photo_id, "date": None, "file": None, "has_video": False}]
+            status.set("Photos", "photo metadata found · not fetched")
+        else:
+            status.set("Photos", "none found")
+
+    status.set("Info", "invite preview collected · no join / no message peek")
+    return snapshot
+
+
+async def collect_snapshot(client: TelegramClient, target: Target, snapshot_dir: Path, scraped_at: datetime, status: LiveStatus) -> dict[str, Any]:
+    """Dispatch TARGET to the appropriate snapshot collector."""
+    if target.invite is not None and not isinstance(target.invite, types.ChatInviteAlready):
+        return await collect_invite_preview(client, target, snapshot_dir, scraped_at, status)
+    if target.type is TargetType.USER:
+        return await collect_user(client, target, snapshot_dir, scraped_at, status)
+    if isinstance(target.entity, types.Channel):
+        return await collect_channel(client, target, snapshot_dir, scraped_at, status)
+    return await collect_basic_group(client, target, snapshot_dir, scraped_at, status)
+
+
+##### STORAGE #####
+
+def target_root(target_type: TargetType) -> str:
+    return {TargetType.USER: "users", TargetType.GROUP: "groups", TargetType.CHANNEL: "channels"}[target_type]
+
+
+def prepare_target_dir(output_dir: Path, target: Target) -> Path:
+    """Create/rename TARGET folder and return its path."""
+    root = output_dir / target_root(target.type)
+    root.mkdir(parents=True, exist_ok=True)
+    wanted = root / f"{target.storage_key}_{safe_path_part(target.username or target.name)}"
+
+    if wanted.exists():
+        return wanted
+
+    old_dirs = sorted(path for path in root.glob(f"{target.storage_key}_*") if path.is_dir())
+    if old_dirs:
+        old_dirs[0].rename(wanted)
+    else:
+        wanted.mkdir()
+    return wanted
+
+
+def create_snapshot_dir(target_dir: Path, timestamp: datetime) -> Path:
+    """Create a unique UTC timestamped snapshot directory and return it."""
+    snapshots = target_dir / "snapshots"
+    snapshots.mkdir(exist_ok=True)
+    name = timestamp.strftime("%Y-%m-%d_%H-%M-%SZ")
+    path, suffix = snapshots / name, 2
+    while path.exists():
+        path, suffix = snapshots / f"{name}_{suffix}", suffix + 1
+    path.mkdir()
+    return path
+
+
+def update_metadata(target_dir: Path, target: Target, snapshot: dict[str, Any], snapshot_dir: Path) -> None:
+    """Update target-level metadata while preserving username history."""
+    path = target_dir / "metadata.json"
+    try:
+        old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        old = {}
+
+    usernames = list(old.get("known_usernames", []))
+    if target.username and target.username not in usernames:
+        usernames.append(target.username)
+
+    write_json(
+        path,
+        {
+            "target_type": target.type.value,
+            "id": target.id,
+            "storage_key": target.storage_key,
+            "current_username": target.username,
+            "current_name": target.name,
+            "known_usernames": usernames,
+            "first_seen_at": old.get("first_seen_at", snapshot["scraped_at"]),
+            "last_seen_at": snapshot["scraped_at"],
+            "latest_snapshot": str(snapshot_dir.relative_to(target_dir)),
+        },
+    )
+
+##### SCRAPE #####
+async def scrape(value: str, output_dir: Path) -> Snapshot:
+    """Resolve VALUE, collect and save one Snapshot, then return it."""
+    api_id, api_hash, session = load_credentials()
+    client = TelegramClient(session, api_id, api_hash)
+    status = LiveStatus()
+    target: Target | None = None
+
+    # Keep first-login phone/code prompts outside the temporary status block.
+    await client.start()
+
+    try:
+        target = await resolve_target(client, value, status)
+        scraped_at = datetime.now(timezone.utc)
+        target_dir = prepare_target_dir(output_dir, target)
+        snapshot_dir = create_snapshot_dir(target_dir, scraped_at)
+        snapshot = await collect_snapshot(client, target, snapshot_dir, scraped_at, status)
+
+        json_file = snapshot_dir / "snapshot.json"
+        write_json(json_file, snapshot)
+        update_metadata(target_dir, target, snapshot, snapshot_dir)
+        return Snapshot(snapshot, json_file, snapshot_dir)
+
+    finally:
+        if target is not None and target.temporary_contact:
+            try:
+                await client(functions.contacts.DeleteContactsRequest(id=[target.entity]))
+            except RPCError as exc:
+                status.clear()
+                print(f"Warning: could not remove temporary contact: {exc}", file=sys.stderr)
+        status.clear()
+        await client.disconnect()
+
+
+##### ARGS #####
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments; exactly one of TARGET or --show is required."""
+    parser = argparse.ArgumentParser(description="Take a snapshot of a Telegram user, group, or channel.")
+    parser.add_argument("target", nargs="?", help="Username, t.me link, private invite link, phone (+/00...), or Telegram numeric ID")
+    parser.add_argument("--show", metavar="SNAPSHOT", type=Path, help="Display a local snapshot without contacting Telegram")
+    parser.add_argument("-o", "--output", type=Path, help="Output directory (overrides TGSNAP_OUTPUT_DIR)")
+    args = parser.parse_args()
+    if (args.target is None) == (args.show is None):
+        parser.error("provide exactly one of: TARGET or --show SNAPSHOT")
+    return args
+
+##### MAIN #####
+async def main() -> int:
+    args = parse_args()
+
+    if args.show:
+        display_snapshot(read_snapshot(args.show))
+        return 0
+
+    try:
+        result = await scrape(args.target, args.output or default_output_dir())
+    except FloodWaitError as exc:
+        print(f"Telegram rate-limited this account. Retry after {exc.seconds} seconds.", file=sys.stderr)
+        return 2
+    except RPCError as exc:
+        print(f"Telegram API error: {exc}", file=sys.stderr)
+        return 3
+
+    display_snapshot(result)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
